@@ -142,7 +142,10 @@ public class DataWritableReadSupport extends ReadSupport<ArrayWritable> {
 
       for(Type t : requestedSchema.getFields()) {
         int index = listColumns.indexOf(t.getName());
-        requestedTypes.add(fileSchema.getType(index));
+        
+        if(index != -1 && index < fileSchema.getFieldCount()) {
+          requestedTypes.add(fileSchema.getType(index));
+        }
       }
 
       requestedSchema = new MessageType(requestedSchema.getName(), requestedTypes);
