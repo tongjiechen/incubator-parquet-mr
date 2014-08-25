@@ -142,7 +142,15 @@ public class DataWritableReadSupport extends ReadSupport<ArrayWritable> {
 
       for(Type t : requestedSchema.getFields()) {
         int index = listColumns.indexOf(t.getName());
-        requestedTypes.add(fileSchema.getType(index));
+     
+        //Take columns based on index or pad the field as done in init()
+        //prefixing with '_mask_' to ensure no conflict with named
+        //columns in the file schema
+        if(index != -1 && index < fileSchema.getFieldCount()) {
+          requestedTypes.add(fileSchema.getType(index));
+        } else {
+          requestedTypes.add(new PrimitiveType(Repetition.OPTIONAL, PrimitiveTypeName.BINARY, "_mask_"+t.getName()));
+        }   
       }
 
       requestedSchema = new MessageType(requestedSchema.getName(), requestedTypes);
