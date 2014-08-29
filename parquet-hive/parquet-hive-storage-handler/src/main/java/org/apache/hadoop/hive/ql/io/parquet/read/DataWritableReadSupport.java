@@ -70,32 +70,48 @@ public class DataWritableReadSupport extends ReadSupport<ArrayWritable> {
   public parquet.hadoop.api.ReadSupport.ReadContext init(final Configuration configuration,
       final Map<String, String> keyValueMetaData, final MessageType fileSchema) {
     final String columns = configuration.get(IOConstants.COLUMNS);
+    
+    boolean columnIndexAccess = configuration.getBoolean(PARQUET_COLUMN_INDEX_ACCESS, false);
+    
     final Map<String, String> contextMetadata = new HashMap<String, String>();
     if (columns != null) {
       final List<String> listColumns = getColumns(columns);
 
       final List<Type> typeListTable = new ArrayList<Type>();
-      for (final String col : listColumns) {
-        // listColumns contains partition columns which are metadata only
-        if (fileSchema.containsField(col)) {
-          typeListTable.add(fileSchema.getType(col));
-        } else {
-          // below allows schema evolution
-          typeListTable.add(new PrimitiveType(Repetition.OPTIONAL, PrimitiveTypeName.BINARY, col));
+      
+      if(columnIndexAccess) {
+        for (int index = 0; index < listColumns.size(); index++) {
+          //Take columns based on index or pad the field
+          if(index < fileSchema.getFieldCount()) {
+            typeListTable.add(fileSchema.getType(index));
+          } else {
+            //prefixing with '_mask_' to ensure no conflict with named
+            //columns in the file schema
+            typeListTable.add(new PrimitiveType(Repetition.OPTIONAL, PrimitiveTypeName.BINARY, "_mask_"+listColumns.get(index)));
+          }
+        }
+      } else {
+        for (final String col : listColumns) {
+          // listColumns contains partition columns which are metadata only
+          if (fileSchema.containsField(col)) {
+            typeListTable.add(fileSchema.getType(col));
+          } else {
+            // below allows schema evolution
+            typeListTable.add(new PrimitiveType(Repetition.OPTIONAL, PrimitiveTypeName.BINARY, col));
+          }
         }
       }
+      
       MessageType tableSchema = new MessageType(TABLE_SCHEMA, typeListTable);
       contextMetadata.put(HIVE_SCHEMA_KEY, tableSchema.toString());
 
-      MessageType requestedSchemaByUser = tableSchema;
       final List<Integer> indexColumnsWanted = ColumnProjectionUtils.getReadColumnIDs(configuration);
 
       final List<Type> typeListWanted = new ArrayList<Type>();
       for (final Integer idx : indexColumnsWanted) {
-        typeListWanted.add(tableSchema.getType(listColumns.get(idx)));
+        typeListWanted.add(columnIndexAccess?tableSchema.getType(idx):tableSchema.getType(listColumns.get(idx)));
       }
-      requestedSchemaByUser = resolveSchemaAccess(new MessageType(fileSchema.getName(),
-              typeListWanted), fileSchema, configuration);
+      MessageType requestedSchemaByUser = new MessageType(fileSchema.getName(), typeListWanted);
 
       return new ReadContext(requestedSchemaByUser, contextMetadata);
     } else {
@@ -123,39 +139,8 @@ public class DataWritableReadSupport extends ReadSupport<ArrayWritable> {
       throw new IllegalStateException("ReadContext not initialized properly. " +
         "Don't know the Hive Schema.");
     }
-    final MessageType tableSchema = resolveSchemaAccess(MessageTypeParser.
-        parseMessageType(metadata.get(HIVE_SCHEMA_KEY)), fileSchema, configuration);
-
+    final MessageType tableSchema = MessageTypeParser.parseMessageType(metadata.get(HIVE_SCHEMA_KEY));
     return new DataWritableRecordConverter(readContext.getRequestedSchema(), tableSchema);
   }
 
-  /**
-  * Determine the file column names based on the position within the requested columns and
-  * use that as the requested schema.
-  */
-  private MessageType resolveSchemaAccess(MessageType requestedSchema, MessageType fileSchema,
-          Configuration configuration) {
-    if(configuration.getBoolean(PARQUET_COLUMN_INDEX_ACCESS, false)) {
-      final List<String> listColumns = getColumns(configuration.get(IOConstants.COLUMNS));
-
-      List<Type> requestedTypes = new ArrayList<Type>();
-
-      for(Type t : requestedSchema.getFields()) {
-        int index = listColumns.indexOf(t.getName());
-     
-        //Take columns based on index or pad the field as done in init()
-        //prefixing with '_mask_' to ensure no conflict with named
-        //columns in the file schema
-        if(index != -1 && index < fileSchema.getFieldCount()) {
-          requestedTypes.add(fileSchema.getType(index));
-        } else {
-          requestedTypes.add(new PrimitiveType(Repetition.OPTIONAL, PrimitiveTypeName.BINARY, "_mask_"+t.getName()));
-        }   
-      }
-
-      requestedSchema = new MessageType(requestedSchema.getName(), requestedTypes);
-    }
-
-    return requestedSchema;
-  }
 }
