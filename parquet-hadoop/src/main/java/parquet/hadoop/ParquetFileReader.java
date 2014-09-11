@@ -183,6 +183,7 @@ public class ParquetFileReader implements Closeable {
   }
 
   private static <T> List<T> runAllInParallel(int parallelism, List<Callable<T>> toRun) throws ExecutionException {
+    LOG.info("Initiating action with parallelism: " + parallelism);
     ExecutorService threadPool = Executors.newFixedThreadPool(parallelism);
     try {
       List<Future<T>> futures = new ArrayList<Future<T>>();
