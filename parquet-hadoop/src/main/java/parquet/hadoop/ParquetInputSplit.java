@@ -132,7 +132,7 @@ public class ParquetInputSplit extends FileSplit implements Writable {
   /**
    * @return the requested schema
    */
-  String getRequestedSchema() {
+  public String getRequestedSchema() {
     return requestedSchema;
   }
 
@@ -146,14 +146,14 @@ public class ParquetInputSplit extends FileSplit implements Writable {
   /**
    * @return app specific metadata provided by the read support in the init phase
    */
-  Map<String, String> getReadSupportMetadata() {
+  public Map<String, String> getReadSupportMetadata() {
     return readSupportMetadata;
   }
 
   /**
    * @return the offsets of the row group selected if this has been determined on the client side
    */
-  long[] getRowGroupOffsets() {
+  public long[] getRowGroupOffsets() {
     return rowGroupOffsets;
   }
 
