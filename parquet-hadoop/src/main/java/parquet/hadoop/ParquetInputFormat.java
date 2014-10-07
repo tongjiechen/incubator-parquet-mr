@@ -249,8 +249,8 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
   @Override
   public List<InputSplit> getSplits(JobContext jobContext) throws IOException {
     Configuration configuration = ContextUtil.getConfiguration(jobContext);
-    List<FileStatus> statuses = listStatus(jobContext);
-    return new ArrayList<InputSplit>(getSplits(configuration, statuses));
+    List<FileStatus> fileStatusList = listStatus(jobContext);
+    return new ArrayList<InputSplit>(getSplits(configuration, fileStatusList));
   }
 
   /**
@@ -260,33 +260,14 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
    * @throws IOException
    */
   public List<ParquetInputSplit> getSplits(Configuration configuration, List<FileStatus> fileStatusList) throws IOException {
-    boolean taskSideMetaData = isTaskSideMetaData(configuration);
-    boolean strictTypeChecking = configuration.getBoolean(STRICT_TYPE_CHECKING, true);
+    SplitStrategy splitStrategy = SplitStrategy.getSplitStrategy(configuration);
     final long maxSplitSize = configuration.getLong("mapred.max.split.size", Long.MAX_VALUE);
     final long minSplitSize = Math.max(getFormatMinSplitSize(), configuration.getLong("mapred.min.split.size", 0L));
     if (maxSplitSize < 0 || minSplitSize < 0) {
       throw new ParquetDecodingException("maxSplitSize or minSplitSize should not be negative: maxSplitSize = " + maxSplitSize + "; minSplitSize = " + minSplitSize);
     }
-
-    List<FileStatus> fileStatusesForFooters = fileStatusList;
-
-    //if we choose to sample footers, one fileStatus will be picked from each parent folder.
-    //for example, in case of hcatalog, parquet-hive does not generate summary _metadata, if there are a lot of 
-    //file generated, for parquet-pig to read through each footer will be time consuming. Also in case of task side
-    //metadata, reading footers is just for getting file schema, any file within a parent folder (e.g. same partition) should
-    //have the same fileschema. Hence, samplingFooters only make senses for task side metadata.
-    if (taskSideMetaData && samplingFooters(configuration)) {
-       fileStatusesForFooters = pickOneFileFromEachFolder(fileStatusList);
-    }
-
-    List<Footer> footers = getFooters(configuration, fileStatusesForFooters);
-    GlobalMetaData globalMetaData = ParquetFileWriter.getGlobalMetaData(footers, strictTypeChecking);
-    ReadContext readContext = getReadSupport(configuration).init(new InitContext(
-        configuration,
-        globalMetaData.getKeyValueMetaData(),
-        globalMetaData.getSchema()));
-
-    return SplitStrategy.getSplitStrategy(taskSideMetaData).getSplits(configuration, fileStatusList, maxSplitSize, minSplitSize, footers, readContext);
+    ReadSupport<T> readSupport = getReadSupport(configuration);
+    return splitStrategy.getSplits(configuration, fileStatusList, maxSplitSize, minSplitSize, readSupport);
   }
 
   /*
@@ -393,7 +374,7 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
     return footers;
   }
 
-  public List<Footer> getFooters(Configuration configuration, List<FileStatus> statuses) throws IOException {
+  public static List<Footer> getFooters(Configuration configuration, List<FileStatus> statuses) throws IOException {
     return getFooters(configuration, (Collection<FileStatus>)statuses);
   }
 
@@ -404,7 +385,7 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
    * @return the footers of the files
    * @throws IOException
    */
-  public List<Footer> getFooters(Configuration configuration, Collection<FileStatus> statuses) throws IOException {
+  public static List<Footer> getFooters(Configuration configuration, Collection<FileStatus> statuses) throws IOException {
     if (Log.DEBUG) LOG.debug("reading " + statuses.size() + " files");
     boolean taskSideMetaData = isTaskSideMetaData(configuration);
     return ParquetFileReader.readAllFootersInParallelUsingSummaryFiles(configuration, statuses, taskSideMetaData);
@@ -417,20 +398,6 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
    */
   public GlobalMetaData getGlobalMetaData(JobContext jobContext) throws IOException {
     return ParquetFileWriter.getGlobalMetaData(getFooters(jobContext));
-  }
-  
-  private List<FileStatus> pickOneFileFromEachFolder(List<FileStatus> fileStatusList) {
-     Set<Path> parents = new HashSet<Path>();
-     List<FileStatus> samples = new ArrayList<FileStatus>();
-     for (FileStatus part : fileStatusList) {
-        if (parents.contains(part.getPath().getParent())) {
-            continue;
-	    } else {
-	    	parents.add(part.getPath().getParent());
-            samples.add(part);
-        }
-     }
-     return samples;
   }
 
   /**
@@ -512,30 +479,51 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
 }
 abstract class SplitStrategy {
   private static final Log LOG = Log.getLog(SplitStrategy.class);
-
-  static SplitStrategy getSplitStrategy(boolean taskSideMetaData) {
+  static SplitStrategy getSplitStrategy(Configuration configuration) {
+    boolean taskSideMetaData = ParquetInputFormat.isTaskSideMetaData(configuration);
     if (taskSideMetaData) {
-      LOG.info("Using Task Side Metadata Split Strategy");
-      return new TaskSideMetadataSplitStrategy();
+      if (ParquetInputFormat.samplingFooters(configuration)){
+         LOG.info("Using Task Side Metadata Split and Footers Sampling Strategy");
+         return new TaskSideFooterSamplingSplitStrategy();
+      } else {
+         LOG.info("Using Task Side Metadata Split Strategy");
+         return new TaskSideMetadataSplitStrategy();
+      }
     } else {
       LOG.info("Using Client Side Metadata Split Strategy");
       return new ClientSideMetadataSplitStrategy();
     }
   }
 
-  abstract List<ParquetInputSplit> getSplits(
+  protected List<Footer> getFooter(Configuration configuration, List<FileStatus> fileStatuses) throws IOException {
+	  return ParquetInputFormat.getFooters(configuration, fileStatuses);
+  }
+
+  protected <T> ReadContext initContext(Configuration configuration, List<Footer> footers, ReadSupport<T> readSupport) {
+	  boolean strictTypeChecking = configuration.getBoolean(ParquetInputFormat.STRICT_TYPE_CHECKING, true);
+	  GlobalMetaData globalMetaData = ParquetFileWriter.getGlobalMetaData(footers, strictTypeChecking);
+	  ReadContext readContext = readSupport.init(new InitContext(
+		        configuration,
+		        globalMetaData.getKeyValueMetaData(),
+		        globalMetaData.getSchema()));
+	  return readContext;
+  }
+
+  abstract <T> List<ParquetInputSplit> getSplits(
       Configuration configuration,
       List<FileStatus> fileStatusList,
-      final long maxSplitSize, final long minSplitSize, List<Footer> footers,
-      ReadContext readContext) throws IOException;
+      final long maxSplitSize, final long minSplitSize,
+      ReadSupport<T> readSupport) throws IOException;
 }
+
 class TaskSideMetadataSplitStrategy extends SplitStrategy {
 
   @Override
-  List<ParquetInputSplit> getSplits(Configuration configuration, List<FileStatus> fileStatusList,
-      long maxSplitSize, long minSplitSize, List<Footer> footers, ReadContext readContext) throws IOException {
+  <T> List<ParquetInputSplit> getSplits(Configuration configuration, List<FileStatus> fileStatusList,
+      long maxSplitSize, long minSplitSize, ReadSupport<T> readSupport) throws IOException {
     List<ParquetInputSplit> splits = new ArrayList<ParquetInputSplit>();
-    //task side metadata only inspect fileStatusList
+    List<Footer> footers = getFooter(configuration, fileStatusList);
+    ReadContext readContext = initContext(configuration, footers, readSupport);
     for (FileStatus fileStatus : fileStatusList) {
       FileSystem fs = fileStatus.getPath().getFileSystem(configuration);
       BlockLocation[] fileBlockLocations = fs.getFileBlockLocations(fileStatus, 0, fileStatus.getLen());
@@ -618,6 +606,30 @@ class TaskSideMetadataSplitStrategy extends SplitStrategy {
     return resultSplits;
   }
 }
+
+class TaskSideFooterSamplingSplitStrategy extends TaskSideMetadataSplitStrategy {
+	
+    @Override
+    protected List<Footer> getFooter(Configuration configuration, List<FileStatus> fileStatusList) throws IOException {
+       List<FileStatus> sampleFileStatuses = pickOneFileFromEachFolder(fileStatusList);
+       return ParquetInputFormat.getFooters(configuration, sampleFileStatuses);
+	}
+
+	private List<FileStatus> pickOneFileFromEachFolder(List<FileStatus> fileStatusList) {
+       Set<Path> parents = new HashSet<Path>();
+       List<FileStatus> samples = new ArrayList<FileStatus>();
+       for (FileStatus part : fileStatusList) {
+          if (parents.contains(part.getPath().getParent())) {
+             continue;
+    	  } else {
+     	     parents.add(part.getPath().getParent());
+             samples.add(part);
+          }
+       }
+       return samples;
+    }
+}
+
 class ClientSideMetadataSplitStrategy extends SplitStrategy {
   //Wrapper of hdfs blocks, keep track of which HDFS block is being used
   private static class HDFSBlocks {
@@ -740,15 +752,15 @@ class ClientSideMetadataSplitStrategy extends SplitStrategy {
   private static final Log LOG = Log.getLog(ClientSideMetadataSplitStrategy.class);
 
   @Override
-  List<ParquetInputSplit> getSplits(Configuration configuration, List<FileStatus> fileStatusList,
-      long maxSplitSize, long minSplitSize, List<Footer> footers, ReadContext readContext)
+  <T> List<ParquetInputSplit> getSplits(Configuration configuration, List<FileStatus> fileStatusList,
+      long maxSplitSize, long minSplitSize, ReadSupport<T> readSupport)
       throws IOException {
     List<ParquetInputSplit> splits = new ArrayList<ParquetInputSplit>();
     Filter filter = ParquetInputFormat.getFilter(configuration);
-
+    List<Footer> footers = getFooter(configuration, fileStatusList);
+    ReadContext readContext = initContext(configuration, footers, readSupport);
     long rowGroupsDropped = 0;
     long totalRowGroups = 0;
-    //client side metadata will only inspect footers and ignore fileStatusList
     for (Footer footer : footers) {
       final Path file = footer.getFile();
       LOG.debug(file);
