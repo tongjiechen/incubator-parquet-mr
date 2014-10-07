@@ -55,7 +55,6 @@ import parquet.hadoop.api.ReadSupport;
 import parquet.hadoop.api.ReadSupport.ReadContext;
 import parquet.hadoop.metadata.BlockMetaData;
 import parquet.hadoop.metadata.ColumnChunkMetaData;
-import parquet.hadoop.metadata.FileMetaData;
 import parquet.hadoop.metadata.GlobalMetaData;
 import parquet.hadoop.metadata.ParquetMetadata;
 import parquet.hadoop.util.ConfigurationUtil;
@@ -102,6 +101,10 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
   public static final String FILTER_PREDICATE = "parquet.private.read.filter.predicate";
 
   public static final String TASK_SIDE_METADATA = "parquet.task.side.metadata";
+ 
+  //sample one footer per directory in case of there are a lot of footers and no summary _metadata file. 
+  //for example, parquet-hive does not generate _metadata file.
+  public static final String TASK_SIDE_METADATA_SAMPLE_FOOTERS = "parquet.task.side.metadata.samplefooters";
 
   private static final int MIN_FOOTER_CACHE_SIZE = 100;
 
@@ -111,6 +114,10 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
 
   public static boolean isTaskSideMetaData(Configuration configuration) {
     return configuration.getBoolean(TASK_SIDE_METADATA, Boolean.FALSE);
+  }
+  
+  public static boolean samplingFooters(Configuration configuration) {
+	return configuration.getBoolean(TASK_SIDE_METADATA_SAMPLE_FOOTERS, false);
   }
 
   public static void setReadSupportClass(Job job,  Class<?> readSupportClass) {
@@ -242,7 +249,8 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
   @Override
   public List<InputSplit> getSplits(JobContext jobContext) throws IOException {
     Configuration configuration = ContextUtil.getConfiguration(jobContext);
-    return new ArrayList<InputSplit>(getSplits(configuration, getFooters(jobContext)));
+    List<FileStatus> statuses = listStatus(jobContext);
+    return new ArrayList<InputSplit>(getSplits(configuration, statuses));
   }
 
   /**
@@ -251,7 +259,7 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
    * @return the splits for the footers
    * @throws IOException
    */
-  public List<ParquetInputSplit> getSplits(Configuration configuration, List<Footer> footers) throws IOException {
+  public List<ParquetInputSplit> getSplits(Configuration configuration, List<FileStatus> fileStatusList) throws IOException {
     boolean taskSideMetaData = isTaskSideMetaData(configuration);
     boolean strictTypeChecking = configuration.getBoolean(STRICT_TYPE_CHECKING, true);
     final long maxSplitSize = configuration.getLong("mapred.max.split.size", Long.MAX_VALUE);
@@ -259,13 +267,26 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
     if (maxSplitSize < 0 || minSplitSize < 0) {
       throw new ParquetDecodingException("maxSplitSize or minSplitSize should not be negative: maxSplitSize = " + maxSplitSize + "; minSplitSize = " + minSplitSize);
     }
+
+    List<FileStatus> fileStatusesForFooters = fileStatusList;
+
+    //if we choose to sample footers, one fileStatus will be picked from each parent folder.
+    //for example, in case of hcatalog, parquet-hive does not generate summary _metadata, if there are a lot of 
+    //file generated, for parquet-pig to read through each footer will be time consuming. Also in case of task side
+    //metadata, reading footers is just for getting file schema, any file within a parent folder (e.g. same partition) should
+    //have the same fileschema. Hence, samplingFooters only make senses for task side metadata.
+    if (taskSideMetaData && samplingFooters(configuration)) {
+       fileStatusesForFooters = pickOneFileFromEachFolder(fileStatusList);
+    }
+
+    List<Footer> footers = getFooters(configuration, fileStatusesForFooters);
     GlobalMetaData globalMetaData = ParquetFileWriter.getGlobalMetaData(footers, strictTypeChecking);
     ReadContext readContext = getReadSupport(configuration).init(new InitContext(
         configuration,
         globalMetaData.getKeyValueMetaData(),
         globalMetaData.getSchema()));
 
-    return SplitStrategy.getSplitStrategy(taskSideMetaData).getSplits(configuration, footers, maxSplitSize, minSplitSize, readContext);
+    return SplitStrategy.getSplitStrategy(taskSideMetaData).getSplits(configuration, fileStatusList, maxSplitSize, minSplitSize, footers, readContext);
   }
 
   /*
@@ -397,6 +418,20 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
   public GlobalMetaData getGlobalMetaData(JobContext jobContext) throws IOException {
     return ParquetFileWriter.getGlobalMetaData(getFooters(jobContext));
   }
+  
+  private List<FileStatus> pickOneFileFromEachFolder(List<FileStatus> fileStatusList) {
+     Set<Path> parents = new HashSet<Path>();
+     List<FileStatus> samples = new ArrayList<FileStatus>();
+     for (FileStatus part : fileStatusList) {
+        if (parents.contains(part.getPath().getParent())) {
+            continue;
+	    } else {
+	    	parents.add(part.getPath().getParent());
+            samples.add(part);
+        }
+     }
+     return samples;
+  }
 
   /**
    * A simple wrapper around {@link parquet.hadoop.Footer} that also includes a
@@ -490,21 +525,19 @@ abstract class SplitStrategy {
 
   abstract List<ParquetInputSplit> getSplits(
       Configuration configuration,
-      List<Footer> footers,
-      final long maxSplitSize, final long minSplitSize,
+      List<FileStatus> fileStatusList,
+      final long maxSplitSize, final long minSplitSize, List<Footer> footers,
       ReadContext readContext) throws IOException;
 }
 class TaskSideMetadataSplitStrategy extends SplitStrategy {
 
   @Override
-  List<ParquetInputSplit> getSplits(Configuration configuration, List<Footer> footers,
-      long maxSplitSize, long minSplitSize, ReadContext readContext) throws IOException {
+  List<ParquetInputSplit> getSplits(Configuration configuration, List<FileStatus> fileStatusList,
+      long maxSplitSize, long minSplitSize, List<Footer> footers, ReadContext readContext) throws IOException {
     List<ParquetInputSplit> splits = new ArrayList<ParquetInputSplit>();
-    for (Footer footer : footers) {
-      // TODO: keep status in Footer
-      final Path file = footer.getFile();
-      FileSystem fs = file.getFileSystem(configuration);
-      FileStatus fileStatus = fs.getFileStatus(file);
+    //task side metadata only inspect fileStatusList
+    for (FileStatus fileStatus : fileStatusList) {
+      FileSystem fs = fileStatus.getPath().getFileSystem(configuration);
       BlockLocation[] fileBlockLocations = fs.getFileBlockLocations(fileStatus, 0, fileStatus.getLen());
       splits.addAll(generateTaskSideMDSplits(
           fileBlockLocations,
@@ -513,7 +546,6 @@ class TaskSideMetadataSplitStrategy extends SplitStrategy {
           readContext.getReadSupportMetadata(),
           minSplitSize,
           maxSplitSize));
-
     }
     return splits;
   }
@@ -708,15 +740,15 @@ class ClientSideMetadataSplitStrategy extends SplitStrategy {
   private static final Log LOG = Log.getLog(ClientSideMetadataSplitStrategy.class);
 
   @Override
-  List<ParquetInputSplit> getSplits(Configuration configuration, List<Footer> footers,
-      long maxSplitSize, long minSplitSize, ReadContext readContext)
+  List<ParquetInputSplit> getSplits(Configuration configuration, List<FileStatus> fileStatusList,
+      long maxSplitSize, long minSplitSize, List<Footer> footers, ReadContext readContext)
       throws IOException {
     List<ParquetInputSplit> splits = new ArrayList<ParquetInputSplit>();
     Filter filter = ParquetInputFormat.getFilter(configuration);
 
     long rowGroupsDropped = 0;
     long totalRowGroups = 0;
-
+    //client side metadata will only inspect footers and ignore fileStatusList
     for (Footer footer : footers) {
       final Path file = footer.getFile();
       LOG.debug(file);
