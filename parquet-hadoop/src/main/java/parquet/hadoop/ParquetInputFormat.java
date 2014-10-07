@@ -495,7 +495,7 @@ abstract class SplitStrategy {
     }
   }
 
-  protected List<Footer> getFooter(Configuration configuration, List<FileStatus> fileStatuses) throws IOException {
+  protected List<Footer> getFooters(Configuration configuration, List<FileStatus> fileStatuses) throws IOException {
 	  return ParquetInputFormat.getFooters(configuration, fileStatuses);
   }
 
@@ -522,7 +522,7 @@ class TaskSideMetadataSplitStrategy extends SplitStrategy {
   <T> List<ParquetInputSplit> getSplits(Configuration configuration, List<FileStatus> fileStatusList,
       long maxSplitSize, long minSplitSize, ReadSupport<T> readSupport) throws IOException {
     List<ParquetInputSplit> splits = new ArrayList<ParquetInputSplit>();
-    List<Footer> footers = getFooter(configuration, fileStatusList);
+    List<Footer> footers = getFooters(configuration, fileStatusList);
     ReadContext readContext = initContext(configuration, footers, readSupport);
     for (FileStatus fileStatus : fileStatusList) {
       FileSystem fs = fileStatus.getPath().getFileSystem(configuration);
@@ -610,7 +610,7 @@ class TaskSideMetadataSplitStrategy extends SplitStrategy {
 class TaskSideFooterSamplingSplitStrategy extends TaskSideMetadataSplitStrategy {
 	
     @Override
-    protected List<Footer> getFooter(Configuration configuration, List<FileStatus> fileStatusList) throws IOException {
+    protected List<Footer> getFooters(Configuration configuration, List<FileStatus> fileStatusList) throws IOException {
        List<FileStatus> sampleFileStatuses = pickOneFileFromEachFolder(fileStatusList);
        return ParquetInputFormat.getFooters(configuration, sampleFileStatuses);
 	}
@@ -757,7 +757,7 @@ class ClientSideMetadataSplitStrategy extends SplitStrategy {
       throws IOException {
     List<ParquetInputSplit> splits = new ArrayList<ParquetInputSplit>();
     Filter filter = ParquetInputFormat.getFilter(configuration);
-    List<Footer> footers = getFooter(configuration, fileStatusList);
+    List<Footer> footers = getFooters(configuration, fileStatusList);
     ReadContext readContext = initContext(configuration, footers, readSupport);
     long rowGroupsDropped = 0;
     long totalRowGroups = 0;
