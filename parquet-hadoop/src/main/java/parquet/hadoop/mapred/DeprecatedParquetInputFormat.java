@@ -55,11 +55,10 @@ public class DeprecatedParquetInputFormat<V> extends org.apache.hadoop.mapred.Fi
     }
     return resultSplits;
   }
-  
+
   public List<Footer> getFooters(JobConf job) throws IOException {
     return realInputFormat.getFooters(job, asList(super.listStatus(job)));
   }
-
 
   private static class RecordReaderWrapper<V> implements RecordReader<Void, Container<V>> {
 
